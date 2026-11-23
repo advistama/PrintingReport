@@ -1,303 +1,176 @@
-const SPREADSHEET_ID = SpreadsheetApp.getActiveSpreadsheet().getId();
 const SHEET_TRANSAKSI = 'Transaksi';
 const SHEET_REKAP_HARIAN = 'Rekap_Harian';
 const SHEET_REKAP_JENIS = 'Rekap_Jenis_Cetakan';
 
 function doGet() {
+  initSheets();
   return HtmlService.createHtmlOutputFromFile('Index')
-    .setTitle('Sistem Laporan Percetakan Lengkap')
+    .setTitle('Sistem Manajemen Percetakan Advistama')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
+function getSS_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error('Spreadsheet tidak ditemukan. Pastikan project Apps Script dibuat dari Google Spreadsheet.');
+  return ss;
+}
+
 function initSheets() {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-
-  let trx = ss.getSheetByName(SHEET_TRANSAKSI);
-  if (!trx) trx = ss.insertSheet(SHEET_TRANSAKSI);
-  if (trx.getLastRow() === 0) {
-    trx.appendRow([
-      'ID_Order',
-      'Tanggal',
-      'Nama_Pelanggan',
-      'Jenis_Cetakan',
-      'Bahan_Kertas',
-      'Ukuran_Cetakan',
-      'Mesin_Cetak',
-      'Qty',
-      'Harga_Satuan',
-      'Total_Biaya',
-      'DP_Bayar',
-      'Sisa_Tagihan',
-      'Status_Bayar',
-      'Status_Produksi'
-    ]);
-  }
-
-  let rekapHarian = ss.getSheetByName(SHEET_REKAP_HARIAN);
-  if (!rekapHarian) rekapHarian = ss.insertSheet(SHEET_REKAP_HARIAN);
-  if (rekapHarian.getLastRow() === 0) {
-    rekapHarian.appendRow([
-      'Tanggal',
-      'Jumlah_Order',
-      'Total_Qty',
-      'Total_Omzet',
-      'Total_DP',
-      'Total_Piutang',
-      'Selesai_Cetak'
-    ]);
-  }
-
-  let rekapJenis = ss.getSheetByName(SHEET_REKAP_JENIS);
-  if (!rekapJenis) rekapJenis = ss.insertSheet(SHEET_REKAP_JENIS);
-  if (rekapJenis.getLastRow() === 0) {
-    rekapJenis.appendRow([
-      'Jenis_Cetakan',
-      'Jumlah_Order',
-      'Total_Qty',
-      'Total_Omzet',
-      'Total_Piutang'
-    ]);
-  }
+  const ss = getSS_();
+  const definitions = [
+    [SHEET_TRANSAKSI, ['ID_Order','Tanggal','Nama_Pelanggan','Jenis_Cetakan','Bahan_Kertas','Ukuran_Cetakan','Mesin_Cetak','Qty','Harga_Satuan','Total_Biaya','DP_Bayar','Sisa_Tagihan','Status_Bayar','Status_Produksi']],
+    [SHEET_REKAP_HARIAN, ['Tanggal','Jumlah_Order','Total_Qty','Total_Omzet','Total_DP','Total_Piutang','Selesai_Cetak']],
+    [SHEET_REKAP_JENIS, ['Jenis_Cetakan','Jumlah_Order','Total_Qty','Total_Omzet','Total_Piutang']]
+  ];
+  definitions.forEach(([name, headers]) => {
+    let sh = ss.getSheetByName(name);
+    if (!sh) sh = ss.insertSheet(name);
+    if (sh.getLastRow() === 0) sh.appendRow(headers);
+    sh.setFrozenRows(1);
+    sh.getRange(1, 1, 1, headers.length).setFontWeight('bold').setBackground('#123b32').setFontColor('#ffffff');
+  });
+  return true;
 }
 
 function hitungStatusBayar(totalBiaya, dpBayar) {
   const sisa = Math.max(0, totalBiaya - dpBayar);
-  return {
-    sisaTagihan: sisa,
-    statusBayar: (totalBiaya > 0 && sisa === 0) ? 'Lunas' : 'Belum Lunas'
-  };
+  return { sisaTagihan: sisa, statusBayar: totalBiaya > 0 && sisa === 0 ? 'Lunas' : 'Belum Lunas' };
 }
 
 function simpanTransaksi(data) {
   initSheets();
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const sheet = ss.getSheetByName(SHEET_TRANSAKSI);
+  const sheet = getSS_().getSheetByName(SHEET_TRANSAKSI);
+  const qty = Math.max(0, Number(data.qty) || 0);
+  const hargaSatuan = Math.max(0, Number(data.hargaSatuan) || 0);
+  if (!String(data.namaPelanggan || '').trim()) throw new Error('Nama pelanggan wajib diisi.');
+  if (!String(data.jenisCetakan || '').trim()) throw new Error('Jenis cetakan wajib dipilih.');
+  if (!qty || !hargaSatuan) throw new Error('Qty dan harga satuan harus lebih dari 0.');
 
-  const qty = Number(data.qty) || 0;
-  const hargaSatuan = Number(data.hargaSatuan) || 0;
   const totalBiaya = qty * hargaSatuan;
   const dpBayar = Math.min(totalBiaya, Math.max(0, Number(data.dpBayar) || 0));
   const bayarInfo = hitungStatusBayar(totalBiaya, dpBayar);
-
   const tz = Session.getScriptTimeZone();
-  const idOrder = 'PRT-' + Utilities.formatDate(new Date(), tz, 'yyyyMMdd-HHmmss');
-  const tanggal = data.tanggal || Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  const now = new Date();
+  const idOrder = 'PRT-' + Utilities.formatDate(now, tz, 'yyyyMMdd-HHmmss') + '-' + Math.floor(Math.random() * 900 + 100);
+  const tanggal = data.tanggal || Utilities.formatDate(now, tz, 'yyyy-MM-dd');
 
-  const rowData = [
-    idOrder,
-    tanggal,
-    String(data.namaPelanggan || '').trim(),
-    String(data.jenisCetakan || '').trim(),
-    String(data.bahanKertas || '').trim(),
-    String(data.ukuranCetakan || '').trim(),
-    String(data.mesinCetak || '').trim(),
-    qty,
-    hargaSatuan,
-    totalBiaya,
-    dpBayar,
-    bayarInfo.sisaTagihan,
-    bayarInfo.statusBayar,
-    data.statusProduksi || 'Antrean'
-  ];
-
-  sheet.appendRow(rowData);
+  sheet.appendRow([
+    idOrder, tanggal, String(data.namaPelanggan || '').trim(),
+    String(data.jenisCetakan || '').trim(), String(data.bahanKertas || '').trim(),
+    String(data.ukuranCetakan || '').trim(), String(data.mesinCetak || '').trim(),
+    qty, hargaSatuan, totalBiaya, dpBayar, bayarInfo.sisaTagihan,
+    bayarInfo.statusBayar, data.statusProduksi || 'Antrean'
+  ]);
   updateSemuaRekap();
-
-  return {
-    success: true,
-    idOrder: idOrder,
-    totalBiaya: totalBiaya,
-    sisaTagihan: bayarInfo.sisaTagihan,
-    statusBayar: bayarInfo.statusBayar
-  };
+  return { success: true, idOrder, totalBiaya, sisaTagihan: bayarInfo.sisaTagihan, statusBayar: bayarInfo.statusBayar };
 }
 
 function lunasiOrder(idOrder) {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const sheet = ss.getSheetByName(SHEET_TRANSAKSI);
+  const sheet = getSS_().getSheetByName(SHEET_TRANSAKSI);
+  if (!sheet) throw new Error('Sheet Transaksi belum tersedia.');
   const values = sheet.getDataRange().getValues();
-
   for (let i = 1; i < values.length; i++) {
     if (String(values[i][0]) === String(idOrder)) {
       const totalBiaya = Number(values[i][9]) || 0;
-      const rowNum = i + 1;
-      sheet.getRange(rowNum, 11).setValue(totalBiaya); // DP_Bayar = Total_Biaya
-      sheet.getRange(rowNum, 12).setValue(0);          // Sisa_Tagihan = 0
-      sheet.getRange(rowNum, 13).setValue('Lunas');    // Status_Bayar = Lunas
+      sheet.getRange(i + 1, 11, 1, 3).setValues([[totalBiaya, 0, 'Lunas']]);
       updateSemuaRekap();
       return { success: true };
     }
   }
-  return { success: false, message: 'ID Order tidak ditemukan' };
+  return { success: false, message: 'ID Order tidak ditemukan.' };
 }
 
 function updateStatusProduksi(idOrder, statusBaru) {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const sheet = ss.getSheetByName(SHEET_TRANSAKSI);
+  const allowed = ['Antrean', 'Proses Cetak', 'Selesai'];
+  if (!allowed.includes(statusBaru)) throw new Error('Status produksi tidak valid.');
+  const sheet = getSS_().getSheetByName(SHEET_TRANSAKSI);
   const values = sheet.getDataRange().getValues();
-
   for (let i = 1; i < values.length; i++) {
     if (String(values[i][0]) === String(idOrder)) {
-      sheet.getRange(i + 1, 14).setValue(statusBaru); // Kolom N: Status_Produksi
+      sheet.getRange(i + 1, 14).setValue(statusBaru);
       updateSemuaRekap();
       return { success: true };
     }
   }
-  return { success: false, message: 'ID Order tidak ditemukan' };
+  return { success: false, message: 'ID Order tidak ditemukan.' };
 }
 
 function updateSemuaRekap() {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const ss = getSS_();
   const trxSheet = ss.getSheetByName(SHEET_TRANSAKSI);
   const harianSheet = ss.getSheetByName(SHEET_REKAP_HARIAN);
   const jenisSheet = ss.getSheetByName(SHEET_REKAP_JENIS);
-
   const rows = trxSheet.getDataRange().getValues();
   const tz = Session.getScriptTimeZone();
-
-  const perTanggal = {};
-  const perJenis = {};
+  const perTanggal = {}, perJenis = {};
 
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
     if (!r[0]) continue;
-
-    const tgl = r[1] instanceof Date
-      ? Utilities.formatDate(r[1], tz, 'yyyy-MM-dd')
-      : String(r[1]);
+    const tgl = r[1] instanceof Date ? Utilities.formatDate(r[1], tz, 'yyyy-MM-dd') : String(r[1]);
     const jenis = String(r[3] || 'Lainnya');
-    const qty = Number(r[7]) || 0;
-    const omzet = Number(r[9]) || 0;
-    const dp = Number(r[10]) || 0;
-    const sisa = Number(r[11]) || 0;
+    const qty = Number(r[7]) || 0, omzet = Number(r[9]) || 0;
+    const dp = Number(r[10]) || 0, sisa = Number(r[11]) || 0;
     const statusProd = String(r[13] || '');
-
-    if (!perTanggal[tgl]) {
-      perTanggal[tgl] = { order: 0, qty: 0, omzet: 0, dp: 0, sisa: 0, selesai: 0 };
-    }
-    perTanggal[tgl].order += 1;
-    perTanggal[tgl].qty += qty;
-    perTanggal[tgl].omzet += omzet;
-    perTanggal[tgl].dp += dp;
-    perTanggal[tgl].sisa += sisa;
-    if (statusProd === 'Selesai') perTanggal[tgl].selesai += 1;
-
-    if (!perJenis[jenis]) {
-      perJenis[jenis] = { order: 0, qty: 0, omzet: 0, sisa: 0 };
-    }
-    perJenis[jenis].order += 1;
-    perJenis[jenis].qty += qty;
-    perJenis[jenis].omzet += omzet;
-    perJenis[jenis].sisa += sisa;
+    if (!perTanggal[tgl]) perTanggal[tgl] = {order:0,qty:0,omzet:0,dp:0,sisa:0,selesai:0};
+    Object.assign(perTanggal[tgl], {
+      order: perTanggal[tgl].order + 1, qty: perTanggal[tgl].qty + qty,
+      omzet: perTanggal[tgl].omzet + omzet, dp: perTanggal[tgl].dp + dp,
+      sisa: perTanggal[tgl].sisa + sisa,
+      selesai: perTanggal[tgl].selesai + (statusProd === 'Selesai' ? 1 : 0)
+    });
+    if (!perJenis[jenis]) perJenis[jenis] = {order:0,qty:0,omzet:0,sisa:0};
+    perJenis[jenis].order++; perJenis[jenis].qty += qty;
+    perJenis[jenis].omzet += omzet; perJenis[jenis].sisa += sisa;
   }
 
-  // Update Rekap Harian
-  const outHarian = [[
-    'Tanggal',
-    'Jumlah_Order',
-    'Total_Qty',
-    'Total_Omzet',
-    'Total_DP',
-    'Total_Piutang',
-    'Selesai_Cetak'
-  ]];
-  Object.keys(perTanggal).sort().reverse().forEach(tgl => {
-    const d = perTanggal[tgl];
-    outHarian.push([tgl, d.order, d.qty, d.omzet, d.dp, d.sisa, d.selesai]);
+  const outHarian = [['Tanggal','Jumlah_Order','Total_Qty','Total_O omzet','Total_DP','Total_Piutang','Selesai_Cetak']];
+  Object.keys(perTanggal).sort().reverse().forEach(t => {
+    const d = perTanggal[t]; outHarian.push([t,d.order,d.qty,d.omzet,d.dp,d.sisa,d.selesai]);
   });
+  outHarian[0][3] = 'Total_Omzet';
   harianSheet.clearContents();
-  harianSheet.getRange(1, 1, outHarian.length, outHarian[0].length).setValues(outHarian);
+  harianSheet.getRange(1,1,outHarian.length,outHarian[0].length).setValues(outHarian);
 
-  // Update Rekap Jenis Cetakan
-  const outJenis = [[
-    'Jenis_Cetakan',
-    'Jumlah_Order',
-    'Total_Qty',
-    'Total_Omzet',
-    'Total_Piutang'
-  ]];
+  const outJenis = [['Jenis_Cetakan','Jumlah_Order','Total_Qty','Total_Omzet','Total_Piutang']];
   Object.keys(perJenis).sort().forEach(j => {
-    const d = perJenis[j];
-    outJenis.push([j, d.order, d.qty, d.omzet, d.sisa]);
+    const d = perJenis[j]; outJenis.push([j,d.order,d.qty,d.omzet,d.sisa]);
   });
   jenisSheet.clearContents();
-  jenisSheet.getRange(1, 1, outJenis.length, outJenis[0].length).setValues(outJenis);
+  jenisSheet.getRange(1,1,outJenis.length,outJenis[0].length).setValues(outJenis);
+  initSheets();
 }
 
 function getLaporanData() {
   initSheets();
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const tz = Session.getScriptTimeZone();
-
+  const ss = getSS_(), tz = Session.getScriptTimeZone();
   const trxValues = ss.getSheetByName(SHEET_TRANSAKSI).getDataRange().getValues();
   const transaksi = [];
-
   for (let i = 1; i < trxValues.length; i++) {
-    const r = trxValues[i];
-    if (!r[0]) continue;
-
-    const tgl = r[1] instanceof Date
-      ? Utilities.formatDate(r[1], tz, 'yyyy-MM-dd')
-      : String(r[1]);
-
-    const totalBiaya = Number(r[9]) || 0;
-    const dpBayar = Number(r[10]) || 0;
-    const sisaTagihan = Number(r[11]) || Math.max(0, totalBiaya - dpBayar);
-
+    const r = trxValues[i]; if (!r[0]) continue;
+    const tgl = r[1] instanceof Date ? Utilities.formatDate(r[1], tz, 'yyyy-MM-dd') : String(r[1]);
+    const total = Number(r[9]) || 0, dp = Number(r[10]) || 0;
+    const sisa = Number(r[11]) || Math.max(0, total - dp);
     transaksi.push({
-      idOrder: String(r[0]),
-      tanggal: tgl,
-      namaPelanggan: String(r[2]),
-      jenisCetakan: String(r[3]),
-      bahanKertas: String(r[4]),
-      ukuranCetakan: String(r[5]),
-      mesinCetak: String(r[6]),
-      qty: Number(r[7]) || 0,
-      hargaSatuan: Number(r[8]) || 0,
-      totalBiaya: totalBiaya,
-      dpBayar: dpBayar,
-      sisaTagihan: sisaTagihan,
-      statusBayar: String(r[12] || (sisaTagihan === 0 ? 'Lunas' : 'Belum Lunas')),
-      statusProduksi: String(r[13] || 'Antrean')
+      idOrder:String(r[0]), tanggal:tgl, namaPelanggan:String(r[2] || ''),
+      jenisCetakan:String(r[3] || ''), bahanKertas:String(r[4] || ''),
+      ukuranCetakan:String(r[5] || ''), mesinCetak:String(r[6] || ''),
+      qty:Number(r[7]) || 0, hargaSatuan:Number(r[8]) || 0,
+      totalBiaya:total, dpBayar:dp, sisaTagihan:sisa,
+      statusBayar:String(r[12] || (sisa === 0 ? 'Lunas' : 'Belum Lunas')),
+      statusProduksi:String(r[13] || 'Antrean')
     });
   }
-
   const harianValues = ss.getSheetByName(SHEET_REKAP_HARIAN).getDataRange().getValues();
-  const rekapHarian = [];
-  for (let i = 1; i < harianValues.length; i++) {
-    const r = harianValues[i];
-    if (!r[0]) continue;
-    const tgl = r[0] instanceof Date
-      ? Utilities.formatDate(r[0], tz, 'yyyy-MM-dd')
-      : String(r[0]);
-    rekapHarian.push({
-      tanggal: tgl,
-      jumlahOrder: Number(r[1]) || 0,
-      totalQty: Number(r[2]) || 0,
-      totalOmzet: Number(r[3]) || 0,
-      totalDp: Number(r[4]) || 0,
-      totalPiutang: Number(r[5]) || 0,
-      selesaiCetak: Number(r[6]) || 0
-    });
-  }
-
+  const rekapHarian = harianValues.slice(1).filter(r => r[0]).map(r => ({
+    tanggal:r[0] instanceof Date ? Utilities.formatDate(r[0],tz,'yyyy-MM-dd') : String(r[0]),
+    jumlahOrder:Number(r[1])||0,totalQty:Number(r[2])||0,totalOmzet:Number(r[3])||0,
+    totalDp:Number(r[4])||0,totalPiutang:Number(r[5])||0,selesaiCetak:Number(r[6])||0
+  }));
   const jenisValues = ss.getSheetByName(SHEET_REKAP_JENIS).getDataRange().getValues();
-  const rekapJenis = [];
-  for (let i = 1; i < jenisValues.length; i++) {
-    const r = jenisValues[i];
-    if (!r[0]) continue;
-    rekapJenis.push({
-      jenisCetakan: String(r[0]),
-      jumlahOrder: Number(r[1]) || 0,
-      totalQty: Number(r[2]) || 0,
-      totalOmzet: Number(r[3]) || 0,
-      totalPiutang: Number(r[4]) || 0
-    });
-  }
-
-  return {
-    transaksi: transaksi.reverse(),
-    rekapHarian: rekapHarian,
-    rekapJenis: rekapJenis
-  };
+  const rekapJenis = jenisValues.slice(1).filter(r => r[0]).map(r => ({
+    jenisCetakan:String(r[0]),jumlahOrder:Number(r[1])||0,totalQty:Number(r[2])||0,
+    totalOmzet:Number(r[3])||0,totalPiutang:Number(r[4])||0
+  }));
+  return {transaksi:transaksi.reverse(),rekapHarian,rekapJenis};
 }
