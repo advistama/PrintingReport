@@ -1,176 +1,680 @@
+from pathlib import Path
+import zipfile, textwrap
+
+root = Path("/mnt/data/advistama_github")
+root.mkdir(exist_ok=True)
+
+(root/"Code.gs").write_text(r'''/**
+ * ADVISTAMA PRINTING - Google Apps Script JSONP API
+ * Buat project Apps Script dari Google Spreadsheet (container-bound).
+ * Deploy sebagai Web App: Execute as Me, akses Anyone.
+ */
 const SHEET_TRANSAKSI = 'Transaksi';
 const SHEET_REKAP_HARIAN = 'Rekap_Harian';
 const SHEET_REKAP_JENIS = 'Rekap_Jenis_Cetakan';
 
-function doGet() {
-  initSheets();
-  return HtmlService.createHtmlOutputFromFile('Index')
-    .setTitle('Sistem Manajemen Percetakan Advistama')
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+function doGet(e) {
+  try {
+    initSheets_();
+    const p = (e && e.parameter) || {};
+    const action = p.action || 'get';
+    let result;
+
+    if (action === 'get') result = getLaporanData_();
+    else if (action === 'create') result = simpanTransaksi_(decodePayload_(p.data));
+    else if (action === 'pay') result = lunasiOrder_(p.idOrder);
+    else if (action === 'production') result = updateStatusProduksi_(p.idOrder, p.status);
+    else result = { success:false, message:'Aksi API tidak dikenal.' };
+
+    return output_(result, p.callback);
+  } catch (err) {
+    return output_({ success:false, message:String(err.message || err) },
+      e && e.parameter && e.parameter.callback);
+  }
+}
+
+function output_(data, callback) {
+  const json = JSON.stringify(data);
+  // Callback dibatasi untuk mencegah penyisipan kode ke halaman.
+  if (callback && /^[A-Za-z_$][0-9A-Za-z_$\\.\\[\\]]*$/.test(callback)) {
+    return ContentService.createTextOutput(callback + '(' + json + ');')
+      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  return ContentService.createTextOutput(json)
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function decodePayload_(encoded) {
+  if (!encoded) throw new Error('Data transaksi kosong.');
+  const bytes = Utilities.base64DecodeWebSafe(encoded);
+  return JSON.parse(Utilities.newBlob(bytes).getDataAsString('UTF-8'));
 }
 
 function getSS_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  if (!ss) throw new Error('Spreadsheet tidak ditemukan. Pastikan project Apps Script dibuat dari Google Spreadsheet.');
+  if (!ss) throw new Error('Spreadsheet aktif tidak ditemukan. Buat Apps Script dari file Google Spreadsheet.');
   return ss;
 }
 
-function initSheets() {
+function initSheets_() {
   const ss = getSS_();
-  const definitions = [
+  const defs = [
     [SHEET_TRANSAKSI, ['ID_Order','Tanggal','Nama_Pelanggan','Jenis_Cetakan','Bahan_Kertas','Ukuran_Cetakan','Mesin_Cetak','Qty','Harga_Satuan','Total_Biaya','DP_Bayar','Sisa_Tagihan','Status_Bayar','Status_Produksi']],
     [SHEET_REKAP_HARIAN, ['Tanggal','Jumlah_Order','Total_Qty','Total_Omzet','Total_DP','Total_Piutang','Selesai_Cetak']],
     [SHEET_REKAP_JENIS, ['Jenis_Cetakan','Jumlah_Order','Total_Qty','Total_Omzet','Total_Piutang']]
   ];
-  definitions.forEach(([name, headers]) => {
+  defs.forEach(([name, headers]) => {
     let sh = ss.getSheetByName(name);
     if (!sh) sh = ss.insertSheet(name);
     if (sh.getLastRow() === 0) sh.appendRow(headers);
     sh.setFrozenRows(1);
-    sh.getRange(1, 1, 1, headers.length).setFontWeight('bold').setBackground('#123b32').setFontColor('#ffffff');
+    sh.getRange(1,1,1,headers.length)
+      .setBackground('#123b32').setFontColor('#ffffff').setFontWeight('bold');
   });
-  return true;
 }
 
-function hitungStatusBayar(totalBiaya, dpBayar) {
-  const sisa = Math.max(0, totalBiaya - dpBayar);
-  return { sisaTagihan: sisa, statusBayar: totalBiaya > 0 && sisa === 0 ? 'Lunas' : 'Belum Lunas' };
-}
-
-function simpanTransaksi(data) {
-  initSheets();
-  const sheet = getSS_().getSheetByName(SHEET_TRANSAKSI);
-  const qty = Math.max(0, Number(data.qty) || 0);
-  const hargaSatuan = Math.max(0, Number(data.hargaSatuan) || 0);
-  if (!String(data.namaPelanggan || '').trim()) throw new Error('Nama pelanggan wajib diisi.');
+function simpanTransaksi_(data) {
+  if (!data || !String(data.namaPelanggan || '').trim()) throw new Error('Nama pelanggan wajib diisi.');
   if (!String(data.jenisCetakan || '').trim()) throw new Error('Jenis cetakan wajib dipilih.');
-  if (!qty || !hargaSatuan) throw new Error('Qty dan harga satuan harus lebih dari 0.');
+  const qty = Math.max(0, Number(data.qty) || 0);
+  const harga = Math.max(0, Number(data.hargaSatuan) || 0);
+  if (!qty || !harga) throw new Error('Qty dan harga satuan harus lebih dari nol.');
 
-  const totalBiaya = qty * hargaSatuan;
-  const dpBayar = Math.min(totalBiaya, Math.max(0, Number(data.dpBayar) || 0));
-  const bayarInfo = hitungStatusBayar(totalBiaya, dpBayar);
-  const tz = Session.getScriptTimeZone();
-  const now = new Date();
-  const idOrder = 'PRT-' + Utilities.formatDate(now, tz, 'yyyyMMdd-HHmmss') + '-' + Math.floor(Math.random() * 900 + 100);
-  const tanggal = data.tanggal || Utilities.formatDate(now, tz, 'yyyy-MM-dd');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const sh = getSS_().getSheetByName(SHEET_TRANSAKSI);
+    const total = qty * harga;
+    const dp = Math.min(total, Math.max(0, Number(data.dpBayar) || 0));
+    const sisa = Math.max(0, total - dp);
+    const tz = Session.getScriptTimeZone();
+    const now = new Date();
+    const id = 'PRT-' + Utilities.formatDate(now, tz, 'yyyyMMdd-HHmmss') +
+      '-' + Math.floor(Math.random() * 900 + 100);
+    const tanggal = data.tanggal || Utilities.formatDate(now, tz, 'yyyy-MM-dd');
 
-  sheet.appendRow([
-    idOrder, tanggal, String(data.namaPelanggan || '').trim(),
-    String(data.jenisCetakan || '').trim(), String(data.bahanKertas || '').trim(),
-    String(data.ukuranCetakan || '').trim(), String(data.mesinCetak || '').trim(),
-    qty, hargaSatuan, totalBiaya, dpBayar, bayarInfo.sisaTagihan,
-    bayarInfo.statusBayar, data.statusProduksi || 'Antrean'
-  ]);
-  updateSemuaRekap();
-  return { success: true, idOrder, totalBiaya, sisaTagihan: bayarInfo.sisaTagihan, statusBayar: bayarInfo.statusBayar };
-}
-
-function lunasiOrder(idOrder) {
-  const sheet = getSS_().getSheetByName(SHEET_TRANSAKSI);
-  if (!sheet) throw new Error('Sheet Transaksi belum tersedia.');
-  const values = sheet.getDataRange().getValues();
-  for (let i = 1; i < values.length; i++) {
-    if (String(values[i][0]) === String(idOrder)) {
-      const totalBiaya = Number(values[i][9]) || 0;
-      sheet.getRange(i + 1, 11, 1, 3).setValues([[totalBiaya, 0, 'Lunas']]);
-      updateSemuaRekap();
-      return { success: true };
-    }
+    sh.appendRow([
+      id, tanggal, String(data.namaPelanggan).trim(),
+      String(data.jenisCetakan).trim(), String(data.bahanKertas || '').trim(),
+      String(data.ukuranCetakan || '').trim(), String(data.mesinCetak || '').trim(),
+      qty, harga, total, dp, sisa, sisa === 0 ? 'Lunas' : 'Belum Lunas',
+      data.statusProduksi || 'Antrean'
+    ]);
+    updateSemuaRekap_();
+    return {success:true, idOrder:id, totalBiaya:total, dpBayar:dp,
+      sisaTagihan:sisa, statusBayar:sisa === 0 ? 'Lunas' : 'Belum Lunas'};
+  } finally {
+    lock.releaseLock();
   }
-  return { success: false, message: 'ID Order tidak ditemukan.' };
 }
 
-function updateStatusProduksi(idOrder, statusBaru) {
-  const allowed = ['Antrean', 'Proses Cetak', 'Selesai'];
-  if (!allowed.includes(statusBaru)) throw new Error('Status produksi tidak valid.');
-  const sheet = getSS_().getSheetByName(SHEET_TRANSAKSI);
-  const values = sheet.getDataRange().getValues();
-  for (let i = 1; i < values.length; i++) {
-    if (String(values[i][0]) === String(idOrder)) {
-      sheet.getRange(i + 1, 14).setValue(statusBaru);
-      updateSemuaRekap();
-      return { success: true };
+function lunasiOrder_(idOrder) {
+  if (!idOrder) throw new Error('ID order tidak tersedia.');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const sh = getSS_().getSheetByName(SHEET_TRANSAKSI);
+    const rows = sh.getDataRange().getValues();
+    for (let i = 1; i < rows.length; i++) {
+      if (String(rows[i][0]) === String(idOrder)) {
+        const total = Number(rows[i][9]) || 0;
+        sh.getRange(i + 1, 11, 1, 3).setValues([[total, 0, 'Lunas']]);
+        updateSemuaRekap_();
+        return {success:true};
+      }
     }
+    return {success:false, message:'ID Order tidak ditemukan.'};
+  } finally {
+    lock.releaseLock();
   }
-  return { success: false, message: 'ID Order tidak ditemukan.' };
 }
 
-function updateSemuaRekap() {
+function updateStatusProduksi_(idOrder, status) {
+  const allowed = ['Antrean','Proses Cetak','Selesai'];
+  if (!allowed.includes(status)) throw new Error('Status produksi tidak valid.');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const sh = getSS_().getSheetByName(SHEET_TRANSAKSI);
+    const rows = sh.getDataRange().getValues();
+    for (let i = 1; i < rows.length; i++) {
+      if (String(rows[i][0]) === String(idOrder)) {
+        sh.getRange(i + 1, 14).setValue(status);
+        updateSemuaRekap_();
+        return {success:true};
+      }
+    }
+    return {success:false, message:'ID Order tidak ditemukan.'};
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function updateSemuaRekap_() {
   const ss = getSS_();
-  const trxSheet = ss.getSheetByName(SHEET_TRANSAKSI);
-  const harianSheet = ss.getSheetByName(SHEET_REKAP_HARIAN);
-  const jenisSheet = ss.getSheetByName(SHEET_REKAP_JENIS);
-  const rows = trxSheet.getDataRange().getValues();
+  const trx = ss.getSheetByName(SHEET_TRANSAKSI).getDataRange().getValues();
+  const harian = ss.getSheetByName(SHEET_REKAP_HARIAN);
+  const jenis = ss.getSheetByName(SHEET_REKAP_JENIS);
   const tz = Session.getScriptTimeZone();
-  const perTanggal = {}, perJenis = {};
+  const byDate = {}, byType = {};
 
-  for (let i = 1; i < rows.length; i++) {
-    const r = rows[i];
+  for (let i = 1; i < trx.length; i++) {
+    const r = trx[i];
     if (!r[0]) continue;
-    const tgl = r[1] instanceof Date ? Utilities.formatDate(r[1], tz, 'yyyy-MM-dd') : String(r[1]);
-    const jenis = String(r[3] || 'Lainnya');
+    const date = r[1] instanceof Date ? Utilities.formatDate(r[1], tz, 'yyyy-MM-dd') : String(r[1]);
+    const type = String(r[3] || 'Lainnya');
     const qty = Number(r[7]) || 0, omzet = Number(r[9]) || 0;
-    const dp = Number(r[10]) || 0, sisa = Number(r[11]) || 0;
-    const statusProd = String(r[13] || '');
-    if (!perTanggal[tgl]) perTanggal[tgl] = {order:0,qty:0,omzet:0,dp:0,sisa:0,selesai:0};
-    Object.assign(perTanggal[tgl], {
-      order: perTanggal[tgl].order + 1, qty: perTanggal[tgl].qty + qty,
-      omzet: perTanggal[tgl].omzet + omzet, dp: perTanggal[tgl].dp + dp,
-      sisa: perTanggal[tgl].sisa + sisa,
-      selesai: perTanggal[tgl].selesai + (statusProd === 'Selesai' ? 1 : 0)
-    });
-    if (!perJenis[jenis]) perJenis[jenis] = {order:0,qty:0,omzet:0,sisa:0};
-    perJenis[jenis].order++; perJenis[jenis].qty += qty;
-    perJenis[jenis].omzet += omzet; perJenis[jenis].sisa += sisa;
+    const dp = Number(r[10]) || 0, debt = Number(r[11]) || 0;
+    if (!byDate[date]) byDate[date] = {orders:0,qty:0,omzet:0,dp:0,debt:0,done:0};
+    byDate[date].orders++; byDate[date].qty += qty; byDate[date].omzet += omzet;
+    byDate[date].dp += dp; byDate[date].debt += debt;
+    if (String(r[13]) === 'Selesai') byDate[date].done++;
+    if (!byType[type]) byType[type] = {orders:0,qty:0,omzet:0,debt:0};
+    byType[type].orders++; byType[type].qty += qty;
+    byType[type].omzet += omzet; byType[type].debt += debt;
   }
 
-  const outHarian = [['Tanggal','Jumlah_Order','Total_Qty','Total_O omzet','Total_DP','Total_Piutang','Selesai_Cetak']];
-  Object.keys(perTanggal).sort().reverse().forEach(t => {
-    const d = perTanggal[t]; outHarian.push([t,d.order,d.qty,d.omzet,d.dp,d.sisa,d.selesai]);
+  const daily = [['Tanggal','Jumlah_Order','Total_Qty','Total_Omzet','Total_DP','Total_Piutang','Selesai_Cetak']];
+  Object.keys(byDate).sort().reverse().forEach(k => {
+    const x = byDate[k]; daily.push([k,x.orders,x.qty,x.omzet,x.dp,x.debt,x.done]);
   });
-  outHarian[0][3] = 'Total_Omzet';
-  harianSheet.clearContents();
-  harianSheet.getRange(1,1,outHarian.length,outHarian[0].length).setValues(outHarian);
+  harian.clearContents();
+  harian.getRange(1,1,daily.length,daily[0].length).setValues(daily);
 
-  const outJenis = [['Jenis_Cetakan','Jumlah_Order','Total_Qty','Total_Omzet','Total_Piutang']];
-  Object.keys(perJenis).sort().forEach(j => {
-    const d = perJenis[j]; outJenis.push([j,d.order,d.qty,d.omzet,d.sisa]);
+  const types = [['Jenis_Cetakan','Jumlah_Order','Total_Qty','Total_Omzet','Total_Piutang']];
+  Object.keys(byType).sort().forEach(k => {
+    const x = byType[k]; types.push([k,x.orders,x.qty,x.omzet,x.debt]);
   });
-  jenisSheet.clearContents();
-  jenisSheet.getRange(1,1,outJenis.length,outJenis[0].length).setValues(outJenis);
-  initSheets();
+  jenis.clearContents();
+  jenis.getRange(1,1,types.length,types[0].length).setValues(types);
 }
 
-function getLaporanData() {
-  initSheets();
+function getLaporanData_() {
   const ss = getSS_(), tz = Session.getScriptTimeZone();
-  const trxValues = ss.getSheetByName(SHEET_TRANSAKSI).getDataRange().getValues();
+  const rows = ss.getSheetByName(SHEET_TRANSAKSI).getDataRange().getValues();
   const transaksi = [];
-  for (let i = 1; i < trxValues.length; i++) {
-    const r = trxValues[i]; if (!r[0]) continue;
-    const tgl = r[1] instanceof Date ? Utilities.formatDate(r[1], tz, 'yyyy-MM-dd') : String(r[1]);
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i]; if (!r[0]) continue;
+    const tanggal = r[1] instanceof Date ? Utilities.formatDate(r[1],tz,'yyyy-MM-dd') : String(r[1]);
     const total = Number(r[9]) || 0, dp = Number(r[10]) || 0;
-    const sisa = Number(r[11]) || Math.max(0, total - dp);
+    const sisa = Number(r[11]) || Math.max(0,total-dp);
     transaksi.push({
-      idOrder:String(r[0]), tanggal:tgl, namaPelanggan:String(r[2] || ''),
-      jenisCetakan:String(r[3] || ''), bahanKertas:String(r[4] || ''),
-      ukuranCetakan:String(r[5] || ''), mesinCetak:String(r[6] || ''),
-      qty:Number(r[7]) || 0, hargaSatuan:Number(r[8]) || 0,
-      totalBiaya:total, dpBayar:dp, sisaTagihan:sisa,
-      statusBayar:String(r[12] || (sisa === 0 ? 'Lunas' : 'Belum Lunas')),
-      statusProduksi:String(r[13] || 'Antrean')
+      idOrder:String(r[0]), tanggal, namaPelanggan:String(r[2]||''),
+      jenisCetakan:String(r[3]||''), bahanKertas:String(r[4]||''),
+      ukuranCetakan:String(r[5]||''), mesinCetak:String(r[6]||''),
+      qty:Number(r[7])||0, hargaSatuan:Number(r[8])||0, totalBiaya:total,
+      dpBayar:dp, sisaTagihan:sisa,
+      statusBayar:String(r[12]||(sisa===0?'Lunas':'Belum Lunas')),
+      statusProduksi:String(r[13]||'Antrean')
     });
   }
-  const harianValues = ss.getSheetByName(SHEET_REKAP_HARIAN).getDataRange().getValues();
-  const rekapHarian = harianValues.slice(1).filter(r => r[0]).map(r => ({
-    tanggal:r[0] instanceof Date ? Utilities.formatDate(r[0],tz,'yyyy-MM-dd') : String(r[0]),
+
+  const dailyRows = ss.getSheetByName(SHEET_REKAP_HARIAN).getDataRange().getValues();
+  const rekapHarian = dailyRows.slice(1).filter(r=>r[0]).map(r=>({
+    tanggal:r[0] instanceof Date?Utilities.formatDate(r[0],tz,'yyyy-MM-dd'):String(r[0]),
     jumlahOrder:Number(r[1])||0,totalQty:Number(r[2])||0,totalOmzet:Number(r[3])||0,
     totalDp:Number(r[4])||0,totalPiutang:Number(r[5])||0,selesaiCetak:Number(r[6])||0
   }));
-  const jenisValues = ss.getSheetByName(SHEET_REKAP_JENIS).getDataRange().getValues();
-  const rekapJenis = jenisValues.slice(1).filter(r => r[0]).map(r => ({
+  const typeRows = ss.getSheetByName(SHEET_REKAP_JENIS).getDataRange().getValues();
+  const rekapJenis = typeRows.slice(1).filter(r=>r[0]).map(r=>({
     jenisCetakan:String(r[0]),jumlahOrder:Number(r[1])||0,totalQty:Number(r[2])||0,
     totalOmzet:Number(r[3])||0,totalPiutang:Number(r[4])||0
   }));
-  return {transaksi:transaksi.reverse(),rekapHarian,rekapJenis};
+  return {success:true,transaksi:transaksi.reverse(),rekapHarian,rekapJenis};
 }
+
+/** Jalankan satu kali dari editor Apps Script untuk membuat ketiga sheet. */
+function setupDatabase() {
+  initSheets_();
+  updateSemuaRekap_();
+}
+''', encoding="utf-8")
+
+(root/"index.html").write_text(r'''<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#123b32">
+  <title>Advistama Printing | Sistem Manajemen</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">A</div><div><b>ADVISTAMA</b><small>PRINTING MANAGEMENT</small></div></div>
+    <div class="nav-caption">MENU UTAMA</div>
+    <nav>
+      <button class="nav active" data-page="dashboard">▦ <span>Dashboard</span></button>
+      <button class="nav" data-page="input">＋ <span>Input Transaksi</span></button>
+      <button class="nav" data-page="orders">▤ <span>Data Transaksi</span></button>
+      <button class="nav" data-page="reports">▥ <span>Laporan</span></button>
+    </nav>
+    <div class="side-note">Sistem Manajemen Percetakan<br>Advistama Printing © 2026</div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <div><h1 id="pageTitle">Dashboard</h1><p id="pageDesc">Ringkasan aktivitas usaha percetakan Anda.</p></div>
+      <div class="date-chip" id="today"></div>
+    </header>
+
+    <section class="page active" id="dashboard">
+      <div class="stats">
+        <article class="stat"><div>Total Order <i>▤</i></div><strong id="statOrders">0</strong><small>Seluruh transaksi tercatat</small></article>
+        <article class="stat"><div>Total Omzet <i>Rp</i></div><strong id="statSales">Rp0</strong><small>Nilai seluruh pesanan</small></article>
+        <article class="stat"><div>Uang Masuk / DP <i>↙</i></div><strong id="statPaid">Rp0</strong><small>Pembayaran diterima</small></article>
+        <article class="stat"><div>Sisa Piutang <i>◷</i></div><strong id="statDebt">Rp0</strong><small>Tagihan belum lunas</small></article>
+      </div>
+      <div class="columns">
+        <article class="panel"><div class="panel-heading"><div><h2>Transaksi Terbaru</h2><p>Pesanan yang baru dicatat</p></div><button class="btn light" data-go="orders">Lihat semua</button></div><div class="table-scroll"><table><thead><tr><th>ID Order</th><th>Pelanggan</th><th>Total</th><th>Produksi</th></tr></thead><tbody id="recentBody"></tbody></table></div></article>
+        <article class="panel"><div class="panel-heading"><div><h2>Status Produksi</h2><p>Ringkasan pesanan</p></div></div><div id="productionBars"></div></article>
+      </div>
+    </section>
+
+    <section class="page" id="input">
+      <article class="panel form-panel">
+        <div class="panel-heading"><div><h2>Form Transaksi Baru</h2><p>Isi data pesanan pelanggan.</p></div></div>
+        <form id="orderForm" class="form-grid">
+          <label>Tanggal Transaksi *<input type="date" id="date" required></label>
+          <label>Nama Pelanggan *<input id="customer" placeholder="Nama pelanggan / instansi" required maxlength="120"></label>
+          <label>Jenis Cetakan *<select id="kind" required><option value="">Pilih jenis cetakan</option><option>Banner / Spanduk</option><option>Brosur</option><option>Undangan</option><option>Stiker</option><option>Buku Yasin</option><option>Kartu Nama</option><option>Poster</option><option>Neon Box</option><option>ID Card</option><option>Souvenir</option><option>Lainnya</option></select></label>
+          <label>Bahan / Kertas<input id="material" placeholder="Contoh: Flexi Korea 340 gsm"></label>
+          <label>Ukuran Cetakan<input id="size" placeholder="Contoh: 300 x 100 cm"></label>
+          <label>Mesin Cetak<input id="machine" placeholder="Nama / tipe mesin"></label>
+          <label>Jumlah / Qty *<input type="number" id="qty" min="1" value="1" required></label>
+          <label>Harga Satuan (Rp) *<input type="number" id="price" min="1" placeholder="0" required></label>
+          <label>DP / Pembayaran Awal (Rp)<input type="number" id="dp" min="0" value="0"></label>
+          <label>Status Produksi<select id="production"><option>Antrean</option><option>Proses Cetak</option><option>Selesai</option></select></label>
+          <div class="total-preview"><div><small>Total transaksi</small><b id="totalPreview">Rp0</b></div><div><small>Sisa tagihan</small><b id="debtPreview">Rp0</b></div></div>
+          <div class="form-actions"><button class="btn" id="saveBtn">Simpan Transaksi</button><button class="btn light" type="reset">Kosongkan</button><span class="help">Total dihitung otomatis: Qty × Harga satuan.</span></div>
+        </form>
+      </article>
+    </section>
+
+    <section class="page" id="orders">
+      <article class="panel">
+        <div class="panel-heading"><div><h2>Data Transaksi</h2><p>Pantau pesanan, pembayaran, dan progres produksi.</p></div><button class="btn" data-go="input">＋ Transaksi Baru</button></div>
+        <div class="filters"><input id="search" placeholder="Cari ID order / pelanggan..."><select id="productionFilter"><option value="">Semua status produksi</option><option>Antrean</option><option>Proses Cetak</option><option>Selesai</option></select><select id="paymentFilter"><option value="">Semua pembayaran</option><option>Lunas</option><option>Belum Lunas</option></select></div>
+        <div class="table-scroll"><table class="orders-table"><thead><tr><th>Tanggal / ID</th><th>Pelanggan</th><th>Jenis</th><th>Qty</th><th>Total</th><th>DP</th><th>Sisa</th><th>Bayar</th><th>Produksi</th><th>Aksi</th></tr></thead><tbody id="ordersBody"></tbody></table></div>
+      </article>
+    </section>
+
+    <section class="page" id="reports">
+      <div class="stats report-stats">
+        <article class="stat"><div>Jumlah Order</div><strong id="reportOrders">0</strong></article>
+        <article class="stat"><div>Total Qty</div><strong id="reportQty">0</strong></article>
+        <article class="stat"><div>Pesanan Selesai</div><strong id="reportDone">0</strong></article>
+        <article class="stat"><div>Total Piutang</div><strong id="reportDebt">Rp0</strong></article>
+      </div>
+      <article class="panel"><div class="panel-heading"><div><h2>Rekap Harian</h2><p>Ringkasan berdasarkan tanggal transaksi.</p></div><button class="btn light" onclick="window.print()">Cetak laporan</button></div><div class="table-scroll"><table><thead><tr><th>Tanggal</th><th>Order</th><th>Qty</th><th>Omzet</th><th>DP</th><th>Piutang</th><th>Selesai</th></tr></thead><tbody id="dailyBody"></tbody></table></div></article>
+      <article class="panel"><div class="panel-heading"><div><h2>Rekap Jenis Cetakan</h2><p>Perbandingan pesanan menurut jenis produk.</p></div></div><div class="table-scroll"><table><thead><tr><th>Jenis Cetakan</th><th>Order</th><th>Qty</th><th>Omzet</th><th>Piutang</th></tr></thead><tbody id="typesBody"></tbody></table></div></article>
+    </section>
+    <footer>Advistama Printing · Sistem Manajemen Percetakan</footer>
+  </main>
+</div>
+<div class="toast" id="toast" role="status"></div>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
+''', encoding="utf-8")
+
+(root/"style.css").write_text(r''':root{--green:#123b32;--green2:#1d6652;--gold:#d8ad58;--bg:#f4f7f5;--ink:#17231f;--muted:#718078;--line:#e5ebe7}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 Inter,Arial,sans-serif}.shell{display:flex;min-height:100vh}
+.sidebar{width:244px;flex-shrink:0;background:var(--green);color:white;padding:24px 17px;position:relative}
+.brand{display:flex;align-items:center;gap:11px;padding:0 7px 25px;border-bottom:1px solid #ffffff28}.brand-mark{width:42px;height:42px;display:grid;place-items:center;background:var(--gold);border-radius:12px;color:var(--green);font-size:21px;font-weight:900}.brand b{display:block;letter-spacing:.5px}.brand small{display:block;color:#c5d8d0;font-size:10px;letter-spacing:1px}
+.nav-caption{margin:25px 10px 9px;color:#9db8ad;font-size:10px;letter-spacing:1.5px}.sidebar nav{display:grid;gap:4px}.nav{border:0;background:transparent;color:#dce9e3;text-align:left;padding:12px;border-radius:9px;cursor:pointer;font-size:13px}.nav span{margin-left:9px}.nav.active,.nav:hover{background:#ffffff1c;color:#fff}.side-note{position:absolute;bottom:22px;color:#a9c0b6;font-size:11px;line-height:1.8}
+main{flex:1;min-width:0;padding:28px 32px 20px}.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}h1{font-size:24px;margin:0 0 4px;color:#172a23}#pageDesc,.panel-heading p{color:var(--muted);font-size:12px;margin:0}.date-chip{padding:9px 13px;background:white;border:1px solid var(--line);border-radius:9px;color:#53645b;font-size:12px}
+.page{display:none}.page.active{display:block}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:17px}.stat,.panel{background:white;border:1px solid var(--line);border-radius:13px;box-shadow:0 3px 12px #173b2c08}.stat{padding:17px}.stat>div{display:flex;justify-content:space-between;color:var(--muted);font-size:12px}.stat i{font-style:normal;background:#eaf3ee;color:var(--green2);border-radius:9px;padding:6px 8px}.stat strong{display:block;font-size:23px;color:#183b30;margin:10px 0 2px}.stat small{color:#8a9991;font-size:11px}
+.columns{display:grid;grid-template-columns:1.2fr .8fr;gap:15px}.panel{padding:17px;margin-bottom:16px}.panel-heading{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:15px}.panel-heading h2{font-size:15px;margin:0 0 3px}
+.btn{border:0;border-radius:8px;padding:10px 14px;background:var(--green2);color:white;font-weight:700;cursor:pointer;font-size:12px}.btn:hover{filter:brightness(1.08)}.btn.light{background:#edf3ef;color:var(--green)}.btn:disabled{opacity:.6;cursor:wait}
+.table-scroll{overflow:auto}table{width:100%;border-collapse:collapse;white-space:nowrap}th{text-align:left;background:#f7f9f8;color:#738078;font-size:10px;letter-spacing:.45px;text-transform:uppercase;padding:11px 9px}td{padding:11px 9px;border-bottom:1px solid #edf1ee;font-size:12px}tbody tr:hover{background:#fbfdfb}
+.pill{display:inline-block;border-radius:20px;padding:4px 8px;font-size:10px;font-weight:700;background:#f0f3f1;color:#63736a}.pill.done{background:#e4f4e9;color:#21814b}.pill.wait{background:#fff3dc;color:#a36a12}.pill.process{background:#e6f0ff;color:#3266a5}
+.bar-row{display:grid;grid-template-columns:105px 1fr 65px;gap:9px;align-items:center;margin:16px 0;font-size:11px}.bar{height:8px;background:#edf2ef;border-radius:20px;overflow:hidden}.bar i{display:block;height:100%;background:var(--green2);border-radius:20px}
+.form-panel{max-width:950px}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.form-grid label{font-size:11px;font-weight:700;color:#59675f}.form-grid input,.form-grid select,.filters input,.filters select,.orders-table select{display:block;width:100%;margin-top:6px;padding:11px 12px;border:1px solid #dce5df;border-radius:8px;background:white;color:#24342c;font:13px Arial;outline:none}.form-grid input:focus,.form-grid select:focus{border-color:#4b9478;box-shadow:0 0 0 3px #4b94781a}
+.total-preview{grid-column:1/-1;display:flex;justify-content:space-between;background:#f0f6f2;padding:14px;border-radius:10px}.total-preview small{display:block;color:var(--muted);font-size:11px}.total-preview b{display:block;color:var(--green);font-size:19px}.form-actions{grid-column:1/-1;display:flex;align-items:center;gap:8px;flex-wrap:wrap}.help{font-size:11px;color:#839087;margin-left:5px}
+.filters{display:flex;gap:8px;margin-bottom:13px}.filters input{max-width:280px;margin:0}.filters select{width:auto;margin:0}
+.empty{text-align:center;padding:30px;color:#8a9991}.empty b{display:block;color:#52635a}
+footer{padding:14px 2px;color:#8a9991;font-size:11px}.toast{position:fixed;right:22px;bottom:22px;background:#183e32;color:white;padding:13px 17px;border-radius:10px;box-shadow:0 8px 30px #0002;display:none;z-index:20;max-width:min(90vw,480px)}.toast.show{display:block}.busy{opacity:.58;pointer-events:none}
+@media(max-width:950px){.sidebar{width:205px}main{padding:22px}.stats{grid-template-columns:repeat(2,1fr)}.columns{grid-template-columns:1fr}}
+@media(max-width:650px){.shell{display:block}.sidebar{width:100%;padding:13px}.brand{padding:0 4px 10px}.nav-caption,.side-note{display:none}.sidebar nav{display:flex;overflow-x:auto;margin-top:9px}.nav{white-space:nowrap;padding:9px 11px;font-size:11px}.nav span{margin-left:5px}main{padding:18px 12px}.topbar{align-items:flex-start}h1{font-size:21px}.date-chip{display:none}.stats{gap:8px}.stat{padding:12px}.stat strong{font-size:18px}.stat>div{font-size:10px}.form-grid{grid-template-columns:1fr}.total-preview,.form-actions{grid-column:1}.filters{flex-wrap:wrap}.filters input,.filters select{max-width:none;flex:1;min-width:130px}.panel{padding:13px}.panel-heading{align-items:flex-start}.orders-table{min-width:1050px}}
+@media print{.sidebar,.topbar .date-chip,.btn,.filters,footer{display:none!important}main{padding:0}.page{display:none!important}#reports{display:block!important}.panel,.stat{box-shadow:none;break-inside:avoid}}
+''', encoding="utf-8")
+
+(root/"config.js").write_text(r'''/*
+ * GANTI URL DI BAWAH dengan URL Web App Google Apps Script Anda.
+ * Bentuk URL biasanya berakhiran /exec
+ */
+window.ADVISTAMA_CONFIG = {
+  API_URL: "TEMPEL_URL_WEB_APP_APPS_SCRIPT_DI_SINI"
+};
+''', encoding="utf-8")
+
+(root/"app.js").write_text(r'''(() => {
+  "use strict";
+  const cfg = window.ADVISTAMA_CONFIG || {};
+  const API_URL = (cfg.API_URL || "").trim();
+  let DATA = { transaksi: [], rekapHarian: [], rekapJenis: [] };
+  const $ = id => document.getElementById(id);
+  const money = n => "Rp" + Number(n || 0).toLocaleString("id-ID");
+  const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  })[c]);
+  const localDate = () => {
+    const d = new Date(Date.now() - new Date().getTimezoneOffset() * 60000);
+    return d.toISOString().slice(0,10);
+  };
+
+  function notify(message) {
+    const node = $("toast");
+    node.textContent = message;
+    node.classList.add("show");
+    clearTimeout(notify.timer);
+    notify.timer = setTimeout(() => node.classList.remove("show"), 3600);
+  }
+
+  function api(action, params = {}) {
+    return new Promise((resolve, reject) => {
+      if (!API_URL || API_URL.includes("TEMPEL_URL")) {
+        reject(new Error("URL API belum diatur. Isi API_URL pada file config.js."));
+        return;
+      }
+      const callback = "__advistama_cb_" + Date.now() + "_" + Math.floor(Math.random()*100000);
+      const query = new URLSearchParams({ action, ...params, callback });
+      const script = document.createElement("script");
+      let finished = false;
+      const timer = setTimeout(() => done(new Error("Koneksi API timeout. Periksa URL dan deployment Apps Script.")), 25000);
+      function done(err, data) {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        delete window[callback];
+        script.remove();
+        err ? reject(err) : resolve(data);
+      }
+      window[callback] = data => {
+        if (data && data.success === false) done(new Error(data.message || "Permintaan gagal."));
+        else done(null, data);
+      };
+      script.onerror = () => done(new Error("Tidak dapat menghubungi API. Pastikan Web App Apps Script dapat diakses publik."));
+      script.src = API_URL + (API_URL.includes("?") ? "&" : "?") + query.toString();
+      document.head.appendChild(script);
+    });
+  }
+
+  function setPage(page) {
+    document.querySelectorAll(".page").forEach(el => el.classList.toggle("active", el.id === page));
+    document.querySelectorAll(".nav").forEach(el => el.classList.toggle("active", el.dataset.page === page));
+    const titles = {
+      dashboard:["Dashboard","Ringkasan aktivitas usaha percetakan Anda."],
+      input:["Input Transaksi","Catat pesanan baru pelanggan."],
+      orders:["Data Transaksi","Pantau pesanan, pembayaran, dan produksi."],
+      reports:["Laporan Usaha","Rekap transaksi dan performa percetakan."]
+    };
+    $("pageTitle").textContent = titles[page][0];
+    $("pageDesc").textContent = titles[page][1];
+  }
+
+  function pill(status) {
+    const cls = status === "Selesai" || status === "Lunas" ? "done" :
+      status === "Proses Cetak" ? "process" : "wait";
+    return `<span class="pill ${cls}">${esc(status)}</span>`;
+  }
+  function emptyRow(cols) {
+    return `<tr><td colspan="${cols}" class="empty"><b>Belum ada data</b>Data akan tampil setelah transaksi disimpan.</td></tr>`;
+  }
+
+  function render() {
+    const orders = DATA.transaksi || [];
+    const sum = key => orders.reduce((n, x) => n + (Number(x[key]) || 0), 0);
+    $("statOrders").textContent = orders.length;
+    $("statSales").textContent = money(sum("totalBiaya"));
+    $("statPaid").textContent = money(sum("dpBayar"));
+    $("statDebt").textContent = money(sum("sisaTagihan"));
+
+    $("recentBody").innerHTML = orders.slice(0,6).map(x => `
+      <tr><td><b>${esc(x.idOrder)}</b></td><td>${esc(x.namaPelanggan)}</td>
+      <td>${money(x.totalBiaya)}</td><td>${pill(x.statusProduksi)}</td></tr>`).join("") || emptyRow(4);
+
+    const counts = {"Antrean":0,"Proses Cetak":0,"Selesai":0};
+    orders.forEach(x => counts[x.statusProduksi] = (counts[x.statusProduksi] || 0) + 1);
+    $("productionBars").innerHTML = Object.entries(counts).map(([name,count]) => `
+      <div class="bar-row"><span>${name}</span><div class="bar"><i style="width:${orders.length ? count/orders.length*100 : 0}%"></i></div><b>${count} order</b></div>`).join("");
+
+    $("reportOrders").textContent = orders.length;
+    $("reportQty").textContent = sum("qty").toLocaleString("id-ID");
+    $("reportDone").textContent = counts.Selesai || 0;
+    $("reportDebt").textContent = money(sum("sisaTagihan"));
+
+    $("dailyBody").innerHTML = (DATA.rekapHarian || []).map(x => `
+      <tr><td>${esc(x.tanggal)}</td><td>${x.jumlahOrder}</td><td>${x.totalQty}</td>
+      <td>${money(x.totalOmzet)}</td><td>${money(x.totalDp)}</td><td>${money(x.totalPiutang)}</td><td>${x.selesaiCetak}</td></tr>`).join("") || emptyRow(7);
+
+    $("typesBody").innerHTML = (DATA.rekapJenis || []).map(x => `
+      <tr><td>${esc(x.jenisCetakan)}</td><td>${x.jumlahOrder}</td><td>${x.totalQty}</td>
+      <td>${money(x.totalOmzet)}</td><td>${money(x.totalPiutang)}</td></tr>`).join("") || emptyRow(5);
+    renderOrders();
+  }
+
+  function renderOrders() {
+    const q = ($("search").value || "").toLowerCase();
+    const production = $("productionFilter").value;
+    const payment = $("paymentFilter").value;
+    const filtered = (DATA.transaksi || []).filter(x =>
+      (!q || (x.idOrder + " " + x.namaPelanggan).toLowerCase().includes(q)) &&
+      (!production || x.statusProduksi === production) &&
+      (!payment || x.statusBayar === payment)
+    );
+    $("ordersBody").innerHTML = filtered.map(x => `
+      <tr>
+        <td><b>${esc(x.tanggal)}</b><br><small>${esc(x.idOrder)}</small></td>
+        <td>${esc(x.namaPelanggan)}</td><td>${esc(x.jenisCetakan)}</td><td>${x.qty}</td>
+        <td>${money(x.totalBiaya)}</td><td>${money(x.dpBayar)}</td><td><b>${money(x.sisaTagihan)}</b></td>
+        <td>${pill(x.statusBayar)}</td>
+        <td><select aria-label="Status produksi" data-production-id="${esc(x.idOrder)}">
+          <option ${x.statusProduksi==="Antrean"?"selected":""}>Antrean</option>
+          <option ${x.statusProduksi==="Proses Cetak"?"selected":""}>Proses Cetak</option>
+          <option ${x.statusProduksi==="Selesai"?"selected":""}>Selesai</option>
+        </select></td>
+        <td>${x.statusBayar !== "Lunas" ? `<button class="btn pay-btn" data-id="${esc(x.idOrder)}">Lunasi</button>` : "—"}</td>
+      </tr>`).join("") || emptyRow(10);
+  }
+
+  async function refresh() {
+    document.body.classList.add("busy");
+    try {
+      const data = await api("get");
+      DATA = data;
+      render();
+    } catch (e) {
+      notify(e.message);
+    } finally {
+      document.body.classList.remove("busy");
+    }
+  }
+
+  function updatePreview() {
+    const total = (Number($("qty").value) || 0) * (Number($("price").value) || 0);
+    const dp = Math.min(total, Number($("dp").value) || 0);
+    $("totalPreview").textContent = money(total);
+    $("debtPreview").textContent = money(Math.max(0,total-dp));
+  }
+
+  document.querySelectorAll(".nav").forEach(btn => btn.addEventListener("click", () => setPage(btn.dataset.page)));
+  document.querySelectorAll("[data-go]").forEach(btn => btn.addEventListener("click", () => setPage(btn.dataset.go)));
+  $("today").textContent = new Date().toLocaleDateString("id-ID",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
+  $("date").value = localDate();
+  ["qty","price","dp"].forEach(id => $(id).addEventListener("input", updatePreview));
+  $("search").addEventListener("input", renderOrders);
+  $("productionFilter").addEventListener("change", renderOrders);
+  $("paymentFilter").addEventListener("change", renderOrders);
+
+  $("orderForm").addEventListener("submit", async event => {
+    event.preventDefault();
+    const data = {
+      tanggal:$("date").value, namaPelanggan:$("customer").value.trim(),
+      jenisCetakan:$("kind").value, bahanKertas:$("material").value,
+      ukuranCetakan:$("size").value, mesinCetak:$("machine").value,
+      qty:$("qty").value, hargaSatuan:$("price").value,
+      dpBayar:$("dp").value, statusProduksi:$("production").value
+    };
+    const button = $("saveBtn");
+    button.disabled = true; button.textContent = "Menyimpan...";
+    try {
+      // Payload dikirim sebagai base64url dalam JSONP GET untuk menghindari CORS preflight.
+      const bytes = new TextEncoder().encode(JSON.stringify(data));
+      let binary = "";
+      bytes.forEach(b => binary += String.fromCharCode(b));
+      const encoded = btoa(binary).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+      const result = await api("create",{data:encoded});
+      notify("Transaksi tersimpan. ID: " + result.idOrder);
+      $("orderForm").reset();
+      $("date").value = localDate(); $("qty").value = 1; $("dp").value = 0;
+      updatePreview();
+      await refresh();
+      setPage("orders");
+    } catch (e) {
+      notify(e.message);
+    } finally {
+      button.disabled = false; button.textContent = "Simpan Transaksi";
+    }
+  });
+  $("orderForm").addEventListener("reset", () => setTimeout(updatePreview,0));
+
+  $("ordersBody").addEventListener("change", async event => {
+    const select = event.target.closest("[data-production-id]");
+    if (!select) return;
+    select.disabled = true;
+    try {
+      await api("production",{idOrder:select.dataset.productionId,status:select.value});
+      notify("Status produksi diperbarui.");
+      await refresh();
+    } catch(e) { notify(e.message); await refresh(); }
+  });
+  $("ordersBody").addEventListener("click", async event => {
+    const button = event.target.closest(".pay-btn");
+    if (!button) return;
+    if (!confirm("Tandai pesanan ini sudah lunas?")) return;
+    button.disabled = true;
+    try {
+      await api("pay",{idOrder:button.dataset.id});
+      notify("Pembayaran berhasil dilunasi.");
+      await refresh();
+    } catch(e) { notify(e.message); }
+  });
+
+  updatePreview();
+  refresh();
+})();
+''', encoding="utf-8")
+
+(root/"README.md").write_text(r'''# Advistama Printing — Sistem Manajemen Percetakan
+
+Aplikasi web statis untuk GitHub Pages dengan Google Spreadsheet sebagai database dan Google Apps Script sebagai API.
+
+## Fitur
+
+- Dashboard jumlah order, omzet, DP, dan piutang.
+- Input transaksi percetakan.
+- Data transaksi dengan pencarian dan filter.
+- Pelunasan pembayaran.
+- Update status produksi: Antrean, Proses Cetak, Selesai.
+- Rekap harian dan rekap jenis cetakan.
+- Tampilan responsif untuk desktop dan HP.
+
+## Arsitektur
+
+`GitHub Pages (index.html, style.css, app.js)` → `Google Apps Script Web App (JSONP API)` → `Google Spreadsheet`
+
+API memakai JSONP untuk komunikasi lintas domain dari GitHub Pages. Operasi simpan, pelunasan, dan perubahan status dikirim melalui parameter GET yang dienkode base64url.
+
+## A. Siapkan Google Spreadsheet dan Apps Script
+
+1. Buat Google Spreadsheet baru, misalnya `Database Advistama Printing`.
+2. Dari spreadsheet, buka **Ekstensi → Apps Script**.
+3. Hapus kode awal di `Code.gs`, lalu tempel seluruh isi file `Code.gs` dari folder ini.
+4. Klik **Save**.
+5. Pilih fungsi `setupDatabase` pada dropdown fungsi, lalu klik **Run**.
+6. Berikan izin yang diminta Google. Fungsi ini membuat sheet `Transaksi`, `Rekap_Harian`, dan `Rekap_Jenis_Cetakan`.
+7. Klik **Deploy → New deployment**.
+8. Pilih tipe **Web app**.
+9. Atur **Execute as: Me**.
+10. Atur **Who has access: Anyone** agar halaman GitHub Pages dapat memanggil API tanpa login Google.
+11. Klik **Deploy**, selesaikan otorisasi, lalu salin URL Web App yang berakhiran `/exec`.
+
+> Jangan gunakan URL `/dev` untuk aplikasi publik. Gunakan URL deployment `/exec`.
+
+## B. Hubungkan API ke website
+
+1. Buka file `config.js`.
+2. Ganti teks `TEMPEL_URL_WEB_APP_APPS_SCRIPT_DI_SINI` dengan URL Web App `/exec`, contoh format:
+   `https://script.google.com/macros/s/ID_DEPLOYMENT_ANDA/exec`
+3. Simpan perubahan.
+
+## C. Upload ke GitHub
+
+1. Login ke https://github.com.
+2. Klik **New repository**.
+3. Isi nama repository: `advistama-printing`.
+4. Pilih **Public** (diperlukan untuk penggunaan GitHub Pages gratis pada repository publik).
+5. Klik **Create repository**.
+6. Klik **Add file → Upload files**.
+7. Upload lima file website: `index.html`, `style.css`, `app.js`, `config.js`, dan `README.md`. File `Code.gs` boleh ikut disimpan sebagai dokumentasi backend.
+8. Klik **Commit changes**.
+
+## D. Aktifkan GitHub Pages
+
+1. Buka repository → **Settings**.
+2. Pilih menu **Pages**.
+3. Pada bagian **Build and deployment**, pilih **Deploy from a branch**.
+4. Branch pilih `main`, folder pilih `/ (root)`.
+5. Klik **Save**.
+6. Tunggu proses publikasi. URL website akan tampil di halaman Pages, umumnya:
+   `https://USERNAME.github.io/advistama-printing/`
+
+## E. Uji aplikasi
+
+1. Buka URL GitHub Pages.
+2. Pastikan dashboard berhasil memuat data.
+3. Buat satu transaksi percobaan.
+4. Periksa sheet `Transaksi` di Google Spreadsheet.
+5. Uji perubahan status produksi dan tombol `Lunasi`.
+6. Periksa sheet rekap harian dan rekap jenis cetakan.
+
+## Memperbarui aplikasi
+
+- Perubahan tampilan: edit `index.html` atau `style.css` di GitHub.
+- Perubahan perilaku frontend: edit `app.js`.
+- Mengganti URL API: edit `config.js`.
+- Perubahan backend: edit `Code.gs` di Apps Script, simpan, lalu buka **Deploy → Manage deployments → Edit** dan terbitkan versi baru.
+
+## Keamanan dan batasan penting
+
+**Konfigurasi ini adalah website publik tanpa login.** Siapa pun yang mengetahui alamat website dapat melihat data yang dikirim oleh API, dan endpoint API dapat dipanggil langsung. Karena API berjalan sebagai pemilik spreadsheet dan aksesnya `Anyone`, pengunjung yang berniat buruk berpotensi menambah transaksi, mengubah status produksi, atau melunasi order.
+
+- Jangan simpan data sensitif seperti NIK, alamat rumah lengkap, nomor rekening, atau informasi rahasia pelanggan.
+- Jangan menganggap URL API sebagai password atau rahasia; URL tersebut terlihat di file frontend.
+- Untuk pemakaian operasional dengan data pelanggan sungguhan, disarankan menambahkan autentikasi dan otorisasi server-side (misalnya login dan pembatasan peran) sebelum dibuka ke publik.
+- GitHub Pages hanya meng-host file frontend; Google Apps Script dan Spreadsheet tetap menjadi layanan backend/database.
+- JSONP menggunakan GET sehingga payload transaksi harus tetap ringkas. Hindari mengirim file atau gambar melalui endpoint ini.
+
+## Struktur file
+
+```text
+advistama-printing/
+├── index.html
+├── style.css
+├── app.js
+├── config.js
+├── Code.gs
+└── README.md
+```
+''', encoding="utf-8")
+
+zip_path = Path("/mnt/data/Advistama_GitHub_Pages_Lengkap.zip")
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for p in root.iterdir():
+        z.write(p, arcname=p.name)
+print("Paket GitHub selesai dibuat:", zip_path)
+print("Isi:", ", ".join(p.name for p in root.iterdir()))
